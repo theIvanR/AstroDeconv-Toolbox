@@ -109,8 +109,8 @@ for idx = 1:length(rawFiles)
     % 2: Apply Additional Filters (Lowpass/Denoise, etc)
     %rgbSignal = applyGaussianLowPass(rgbSignal, minPixelDetail);
     
-    %net = denoisingNetwork("DnCNN");
-    %rgbSignal = denoiseRGB(rgbSignal, net);
+    net = denoisingNetwork("DnCNN");
+    rgbSignal = denoiseRGB(rgbSignal, net);
 
 
     % 3: Display (linear), scaled
@@ -262,30 +262,24 @@ function outputImage = applyGaussianLowPass(inputImage, minPixelDetail)
 end
 
 
-% Remove Hot Pixel function
+% Remove Hot Pixel function (vectorized, memory-efficient)
 function cleanRawImage = removeHotPixelsRAW(cfaImage)
-    [M, N] = size(cfaImage);  % Get the dimensions of the RAW image (single-channel)
-    
-    % Initialize the cleaned RAW image
+    % cfaImage : single-channel raw image (single or double)
+    % cleanRawImage : same size & type as cfaImage, with hot pixels replaced
+
+    % initialize output
     cleanRawImage = cfaImage;
-    
-    % Create shifted versions of the image to get the neighbors
-    neighborsUp    = [cfaImage(1,:); cfaImage(1:M-1,:)];      % Shift image down
-    neighborsDown  = [cfaImage(2:M,:); cfaImage(M,:)];        % Shift image up
-    neighborsLeft  = [cfaImage(:,1), cfaImage(:,1:N-1)];      % Shift image right
-    neighborsRight = [cfaImage(:,2:N), cfaImage(:,N)];        % Shift image left
-    neighborsUL    = [neighborsUp(:,1), neighborsUp(:,1:N-1)];  % Upper left diagonal
-    neighborsUR    = [neighborsUp(:,2:N), neighborsUp(:,N)];    % Upper right diagonal
-    neighborsDL    = [neighborsDown(:,1), neighborsDown(:,1:N-1)]; % Lower left diagonal
-    neighborsDR    = [neighborsDown(:,2:N), neighborsDown(:,N)];   % Lower right diagonal
 
-    % Average the neighbors for each pixel
-    avgNeighbors = (neighborsUp + neighborsDown + neighborsLeft + neighborsRight + ...
-                    neighborsUL + neighborsUR + neighborsDL + neighborsDR) / 8;
+    % 8-neighbour averaging kernel (center = 0)
+    kernel = [1 1 1; 1 0 1; 1 1 1] / 8;
 
-    % Detect hot pixels by comparing to average neighbors
+    % compute neighbour mean using replicate border handling (matches original)
+    avgNeighbors = imfilter(cfaImage, kernel, 'replicate', 'same');
+
+    % detect hot pixels (same rule as before)
     hotPixelMask = cfaImage > avgNeighbors * 1.5;
 
-    % Replace hot pixels with the average of their neighbors
+    % replace hot pixels with neighbour average
     cleanRawImage(hotPixelMask) = avgNeighbors(hotPixelMask);
 end
+
