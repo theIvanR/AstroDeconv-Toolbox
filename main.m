@@ -28,13 +28,13 @@ useAutoWB = true;                     % true to perform white balance
 doHampel = true;
 
 % LPF Settings (radius, skips if zero)
-minPixelDetail = 0;                  
+minPixelDetail = 4;                  
 
 % CNN Denoiser (DnCNN)
 net = denoisingNetwork("DnCNN");
 
 
-%% Process Flat Frames (placeholder) 
+%% Process Flat Frames 
 tic
 fprintf('Processing %d flat frames...\n', length(flatFiles));
 
@@ -90,8 +90,7 @@ for idx = 1:length(rawFiles)
 
     % Convert RAW -> linear RGB (single). rawToRGB handles hot pixel removal,
     % black subtraction and demosaic for RGGB pattern by default.
-    rgbSignal = rawToRGB(rawFilePath, 'BlackLevel', blackLevel, 'RemoveHotPixels', true, ...
-        'ClipMax', maxVal_img);
+    rgbSignal = rawToRGB(rawFilePath, 'BlackLevel', blackLevel, 'RemoveHotPixels', true, 'ClipMax', maxVal_img);
 
     % Apply master flat correction if available
     if exist('masterFlatInv','var') && ~isempty(masterFlatInv)
@@ -172,14 +171,13 @@ for idx = 1:length(rawFiles)
 
 
     % Apply Physics Filter (blobularity metrics from FWMH blobulity)
-    rgbSignal = physicsStreakCorrector(rgbSignal);
+    %rgbSignal = physicsStreakCorrector(rgbSignal); % blob reshaper (cosmetic, fwhm fixing)
+    rgbSignal = physicsDeconvolution(rgbSignal); %Proper Semi blind deconvolution
 
-    % Apply Noise Filter
-    % Lowpass filter (skips if minPixelDetail == 0)
-    rgbSignal = applyGaussianLowPass(rgbSignal, minPixelDetail);
+    % Apply Noise Filters
+    rgbSignal = denoiseRGB(rgbSignal, net); % CNN Denoiser (very robust)
 
-    % CNN Denoiser (very robust)
-    rgbSignal = denoiseRGB(rgbSignal, net);
+    rgbSignal = applyGaussianLowPass(rgbSignal, minPixelDetail); % LPF(skips if minPixelDetail == 0)
 
 
     % ---------- SHOW ----------
@@ -251,8 +249,138 @@ for idx = 1:length(rawFiles)
 
 end
 
+
 elapsedTime = toc;
 disp(['Done! Elapsed time: ', num2str(elapsedTime), ' sec']);
+
+
+
+%% Process Light Frames  (Parallel version)  
+tic
+fprintf('Processing %d Light frames...\n', length(rawFiles));
+
+% Broadcast main workspace variables to workers
+masterFlatInv_b = masterFlatInv; 
+useIR_b = useIR;
+useAutoWB_b = useAutoWB;
+blackLevel_b = blackLevel;
+maxVal_img_b = maxVal_img;
+net_b = net;
+minPixelDetail_b = minPixelDetail;
+destDir_b = destDir;
+rawFiles_b = rawFiles; 
+
+spmd
+    for idx = 1:length(rawFiles_b)
+        rawFilePath = fullfile(rawFiles_b(idx).folder, rawFiles_b(idx).name);
+        fprintf('\nWorker %d processing %s (%d of %d)...\n', spmdIndex, rawFiles_b(idx).name, idx, length(rawFiles_b));
+    
+        % Convert RAW -> linear RGB (single)
+        rgbSignal = rawToRGB(rawFilePath, 'BlackLevel', blackLevel_b, ...
+                             'RemoveHotPixels', true, 'ClipMax', maxVal_img_b);
+    
+        % Apply master flat correction if available
+        localMasterFlat = masterFlatInv_b;
+        if ~isempty(localMasterFlat)
+            if ~isequal(size(rgbSignal), size(localMasterFlat))
+                warning('Master flat size does not match light frame size — skipping flat correction.');
+            else
+                rgbSignal = rgbSignal .* localMasterFlat;
+            end
+        end
+    
+        % ----------------- AutoWB with selectable reference channel and IR -----------------
+        refChannel = 'G';      % 'R', 'G', or 'B' 
+        allowAmplify = true;   % true = allow gains > 1; false = only attenuate
+    
+        if useIR_b
+            rgbSignal(:, :, 2) = rgbSignal(:, :, 2) / 2;
+        end
+    
+        if useAutoWB_b
+            grayLevels = sum(rgbSignal, 3);
+            threshold = prctile(single(grayLevels(:)), 99.5);
+            mask = grayLevels >= threshold;
+            if ~any(mask(:))
+                threshold = prctile(single(grayLevels(:)), 99.0);
+                mask = grayLevels >= threshold;
+            end
+            if ~any(mask(:))
+                mask = true(size(grayLevels));
+            end
+    
+            R = rgbSignal(:,:,1); G = rgbSignal(:,:,2); B = rgbSignal(:,:,3);
+    
+            scaleR = median(single(R(mask))); scaleG = median(single(G(mask))); scaleB = median(single(B(mask)));
+            tiny = 1e-12;
+            if ~isfinite(scaleR) || scaleR <= tiny, scaleR = median(single(R(:))) + tiny; end
+            if ~isfinite(scaleG) || scaleG <= tiny, scaleG = median(single(G(:))) + tiny; end
+            if ~isfinite(scaleB) || scaleB <= tiny, scaleB = median(single(B(:))) + tiny; end
+    
+            switch upper(refChannel)
+                case 'R', scaleRef = scaleR;
+                case 'G', scaleRef = scaleG;
+                case 'B', scaleRef = scaleB;
+                otherwise, scaleRef = scaleG;
+            end
+    
+            gR = scaleRef / scaleR; gG = scaleRef / scaleG; gB = scaleRef / scaleB;
+            if ~allowAmplify
+                gR = min(gR,1); gG = min(gG,1); gB = min(gB,1);
+            end
+    
+            rgbSignal(:,:,1) = R .* gR;
+            rgbSignal(:,:,2) = G .* gG;
+            rgbSignal(:,:,3) = B .* gB;
+    
+            fprintf('AutoWB(ref=%s): nnz(mask)=%d raw_scales=[%.6g %.6g %.6g] gains=[%.6g %.6g %.6g] finalMax=%.6g\n', ...
+                refChannel, nnz(mask), scaleR, scaleG, scaleB, gR, gG, gB, max(rgbSignal(:)));
+        end
+    
+        % Apply Physics Filter (semi-blind deconvolution)
+        rgbSignal = physicsDeconvolution(rgbSignal);
+    
+        % Apply Noise Filters
+        rgbSignal = denoiseRGB(rgbSignal, net_b); % CNN Denoiser
+        rgbSignal = applyGaussianLowPass(rgbSignal, minPixelDetail_b); % LPF
+    
+        % ---------- SAVE ----------
+        saveMode = 'fp32_scaled';
+        minVal = min(rgbSignal(:));
+        maxVal = max(rgbSignal(:));
+        [~, baseName, ~] = fileparts(rawFiles_b(idx).name);
+        outFile = fullfile(destDir_b, [baseName, '.tif']);
+    
+        switch saveMode
+            case 'fp32_scaled'
+                if maxVal == 0
+                    rgbNorm = zeros(size(rgbSignal), 'single');
+                else
+                    rgbNorm = single(rgbSignal / maxVal_img_b);
+                end
+                t = Tiff(outFile, 'w');
+                tagstruct.ImageLength = size(rgbNorm,1);
+                tagstruct.ImageWidth = size(rgbNorm,2);
+                tagstruct.Photometric = Tiff.Photometric.RGB;
+                tagstruct.BitsPerSample = 32;
+                tagstruct.SampleFormat = Tiff.SampleFormat.IEEEFP;
+                tagstruct.SamplesPerPixel = 3;
+                tagstruct.PlanarConfiguration = Tiff.PlanarConfiguration.Chunky;
+                tagstruct.Compression = Tiff.Compression.None;
+                tagstruct.Software = 'MATLAB';
+                t.setTag(tagstruct);
+                t.write(rgbNorm);
+                t.close();
+                fprintf('Saved FP32 (scaled to [0,%.2f]) to %s\n', max(rgbNorm(:)), outFile);
+        end
+    
+    end
+end
+
+elapsedTime = toc;
+disp(['Done! Elapsed time: ', num2str(elapsedTime), ' sec']);
+
+
 
 
 %% ----------------- Local helper functions -----------------
@@ -393,56 +521,132 @@ function denoisedRGB = denoiseRGB(img, net)
     denoisedRGB = denoisedRGBNorm * maxVal;
 end
 
-
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%Create Ellipse Mask for Stars (Star Reshaping to center and circle)
 function rgbCorrected = physicsStreakCorrector(rgbSignal)
-    % rgbSignal: linear RGB single image
-    % rgbCorrected: streak-corrected output
+        % rgbSignal: linear RGB single image
+        % rgbCorrected: streak-corrected output
+    
+        % Convert to grayscale (luminance)
+        lum = 0.2989*rgbSignal(:,:,1) + 0.5870*rgbSignal(:,:,2) + 0.1140*rgbSignal(:,:,3);
+    
+        % Threshold bright spots (top 0.5%)
+        thresh = prctile(lum(:), 99.5);
+        brightMask = lum >= thresh;
+    
+        % Label connected components (stars)
+        CC = bwconncomp(brightMask);
+        stats = regionprops(CC, 'Centroid', 'MajorAxisLength', 'MinorAxisLength', 'Orientation');
+    
+        % Build a streak map
+        streakMap = zeros(size(lum));
+        for k = 1:numel(stats)
+            ratio = stats(k).MinorAxisLength / stats(k).MajorAxisLength; % blobularity
+            if ratio < 0.8  % adjustable threshold: low ratio = streak
+                % draw an ellipse mask for this star
+                mask = createEllipseMask(size(lum), stats(k).Centroid, ...
+                                         stats(k).MajorAxisLength/2, ...
+                                         stats(k).MinorAxisLength/2, ...
+                                         stats(k).Orientation);
+                streakMap(mask) = 1 - ratio; % weight by streakiness
+            end
+        end
+    
+        % Smooth streaks with anisotropic Gaussian (minor axis only)
+        hsize = 5; % kernel size
+        sigma = 1; % smoothing along minor axis
+        streakCorrected = imgaussfilt(lum, sigma);
+    
+        % Blend back into RGB channels
+        rgbCorrected = rgbSignal;
+        for c = 1:3
+            rgbCorrected(:,:,c) = rgbSignal(:,:,c) .* (1 - streakMap) + streakCorrected .* streakMap;
+        end
+    end
+    
+    % Helper: create an ellipse mask
+    function mask = createEllipseMask(imSize, centroid, a, b, theta)
+        [X, Y] = meshgrid(1:imSize(2), 1:imSize(1));
+        x0 = centroid(1); y0 = centroid(2);
+        theta = deg2rad(theta);
+        Xr = (X - x0)*cos(theta) + (Y - y0)*sin(theta);
+        Yr = -(X - x0)*sin(theta) + (Y - y0)*cos(theta);
+        mask = (Xr.^2)/(a^2) + (Yr.^2)/(b^2) <= 1;
+    end
 
-    % Convert to grayscale (luminance)
+% Proper Semi Blind Deconvolution
+function rgbCorrected = physicsDeconvolution(rgbSignal)
+% rgbSignal: linear RGB single image
+% rgbCorrected: RGB after streak / PSF deconvolution
+%
+% Fully drop-in: just call rgbCorrected = physicsDeconvolution(rgbSignal);
+
+    % ----------------- PARAMETERS -----------------
+    topPercentile = 99.5;  % for bright star detection
+    minBlobularity = 0.8;   % ratio minor/major axis to consider streaked
+    maxStars = 20;          % max stars to consider
+    psfSize = 15;           % PSF kernel size (pixels)
+    rlIterations = 8;       % RL deconvolution iterations
+
+    % ----------------- STEP 1: LUMINANCE -----------------
     lum = 0.2989*rgbSignal(:,:,1) + 0.5870*rgbSignal(:,:,2) + 0.1140*rgbSignal(:,:,3);
 
-    % Threshold bright spots (top 0.5%)
-    thresh = prctile(lum(:), 99.5);
+    % ----------------- STEP 2: BRIGHT STAR DETECTION -----------------
+    thresh = prctile(lum(:), topPercentile);
     brightMask = lum >= thresh;
-
-    % Label connected components (stars)
     CC = bwconncomp(brightMask);
     stats = regionprops(CC, 'Centroid', 'MajorAxisLength', 'MinorAxisLength', 'Orientation');
 
-    % Build a streak map
-    streakMap = zeros(size(lum));
+    % Sort by brightness and limit number of stars
+    starValues = zeros(numel(stats),1);
     for k = 1:numel(stats)
-        ratio = stats(k).MinorAxisLength / stats(k).MajorAxisLength; % blobularity
-        if ratio < 0.8  % adjustable threshold: low ratio = streak
-            % draw an ellipse mask for this star
-            mask = createEllipseMask(size(lum), stats(k).Centroid, ...
-                                     stats(k).MajorAxisLength/2, ...
-                                     stats(k).MinorAxisLength/2, ...
-                                     stats(k).Orientation);
-            streakMap(mask) = 1 - ratio; % weight by streakiness
-        end
+        starValues(k) = lum(round(stats(k).Centroid(2)), round(stats(k).Centroid(1)));
+    end
+    [~, idxSort] = sort(starValues, 'descend');
+    stats = stats(idxSort);
+    if numel(stats) > maxStars
+        stats = stats(1:maxStars);
     end
 
-    % Smooth streaks with anisotropic Gaussian (minor axis only)
-    hsize = 5; % kernel size
-    sigma = 1; % smoothing along minor axis
-    streakCorrected = imgaussfilt(lum, sigma);
+    % ----------------- STEP 3: BUILD AVERAGE STAR PSF -----------------
+    psfAccum = zeros(psfSize, psfSize);
+    count = 0;
+    for k = 1:numel(stats)
+        ratio = stats(k).MinorAxisLength / stats(k).MajorAxisLength;
+        if ratio < minBlobularity
+            % build elliptical PSF kernel
+            a = stats(k).MajorAxisLength / 2;
+            b = stats(k).MinorAxisLength / 2;
+            theta = stats(k).Orientation;
+            psfKernel = createEllipsePSF(psfSize, a, b, theta);
+            psfAccum = psfAccum + psfKernel;
+            count = count + 1;
+        end
+    end
+    if count == 0
+        % fallback to circular PSF
+        psfKernel = fspecial('gaussian', psfSize, 1);
+    else
+        psfKernel = psfAccum / count;
+        psfKernel = psfKernel / sum(psfKernel(:)); % normalize
+    end
 
-    % Blend back into RGB channels
-    rgbCorrected = rgbSignal;
+    % ----------------- STEP 4: DECONVOLVE EACH CHANNEL -----------------
+    rgbCorrected = zeros(size(rgbSignal), 'like', rgbSignal);
     for c = 1:3
-        rgbCorrected(:,:,c) = rgbSignal(:,:,c) .* (1 - streakMap) + streakCorrected .* streakMap;
+        rgbCorrected(:,:,c) = deconvlucy(rgbSignal(:,:,c), psfKernel, rlIterations);
     end
 end
 
-% Helper: create an ellipse mask
-function mask = createEllipseMask(imSize, centroid, a, b, theta)
-    [X, Y] = meshgrid(1:imSize(2), 1:imSize(1));
-    x0 = centroid(1); y0 = centroid(2);
+    % ----------------- HELPER: CREATE ELLIPSE PSF -----------------
+    function psf = createEllipsePSF(psfSize, a, b, theta)
+    % Generate normalized elliptical PSF kernel
+    [X, Y] = meshgrid(1:psfSize, 1:psfSize);
+    x0 = ceil(psfSize/2); y0 = ceil(psfSize/2);
     theta = deg2rad(theta);
     Xr = (X - x0)*cos(theta) + (Y - y0)*sin(theta);
     Yr = -(X - x0)*sin(theta) + (Y - y0)*cos(theta);
-    mask = (Xr.^2)/(a^2) + (Yr.^2)/(b^2) <= 1;
+    psf = exp(-((Xr.^2)/(2*a^2) + (Yr.^2)/(2*b^2)));
+    psf = psf / sum(psf(:));
 end
-
 
