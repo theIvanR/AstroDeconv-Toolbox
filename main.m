@@ -28,7 +28,7 @@ useAutoWB = true;                     % true to perform white balance
 doHampel = true;
 
 % LPF Settings (radius, skips if zero)
-minPixelDetail = 4;                  
+minPixelDetail = 3;                  
 
 % CNN Denoiser (DnCNN)
 net = denoisingNetwork("DnCNN");
@@ -47,10 +47,7 @@ else
         fprintf('  Loading flat: %s\n', flatFiles(idx).name);
 
         % same pipeline as lights
-        flatRGB = rawToRGB(rawPath, ...
-            'BlackLevel', blackLevel, ...
-            'RemoveHotPixels', true, ...
-            'ClipMax', maxVal_img);
+        flatRGB = rawToRGB(rawPath, 'BlackLevel', blackLevel, 'RemoveHotPixels', true, 'ClipMax', maxVal_img);
 
         % stack as single precision
         flatStack(:,:,:,idx) = single(flatRGB);
@@ -170,13 +167,10 @@ for idx = 1:length(rawFiles)
     end
 
 
-    % Apply Physics Filter (blobularity metrics from FWMH blobulity)
-    %rgbSignal = physicsStreakCorrector(rgbSignal); % blob reshaper (cosmetic, fwhm fixing)
-    rgbSignal = physicsDeconvolution(rgbSignal); %Proper Semi blind deconvolution
-
     % Apply Noise Filters
     rgbSignal = denoiseRGB(rgbSignal, net); % CNN Denoiser (very robust)
 
+    %Apply smoothing filters
     rgbSignal = applyGaussianLowPass(rgbSignal, minPixelDetail); % LPF(skips if minPixelDetail == 0)
 
 
@@ -390,134 +384,5 @@ function denoisedRGB = denoiseRGB(img, net)
     % 3. Recombine and rescale back
     denoisedRGBNorm = cat(3, denoisedR, denoisedG, denoisedB);
     denoisedRGB = denoisedRGBNorm * maxVal;
-end
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%Create Ellipse Mask for Stars (Star Reshaping to center and circle)
-function rgbCorrected = physicsStreakCorrector(rgbSignal)
-        % rgbSignal: linear RGB single image
-        % rgbCorrected: streak-corrected output
-    
-        % Convert to grayscale (luminance)
-        lum = 0.2989*rgbSignal(:,:,1) + 0.5870*rgbSignal(:,:,2) + 0.1140*rgbSignal(:,:,3);
-    
-        % Threshold bright spots (top 0.5%)
-        thresh = prctile(lum(:), 99.5);
-        brightMask = lum >= thresh;
-    
-        % Label connected components (stars)
-        CC = bwconncomp(brightMask);
-        stats = regionprops(CC, 'Centroid', 'MajorAxisLength', 'MinorAxisLength', 'Orientation');
-    
-        % Build a streak map
-        streakMap = zeros(size(lum));
-        for k = 1:numel(stats)
-            ratio = stats(k).MinorAxisLength / stats(k).MajorAxisLength; % blobularity
-            if ratio < 0.8  % adjustable threshold: low ratio = streak
-                % draw an ellipse mask for this star
-                mask = createEllipseMask(size(lum), stats(k).Centroid, ...
-                                         stats(k).MajorAxisLength/2, ...
-                                         stats(k).MinorAxisLength/2, ...
-                                         stats(k).Orientation);
-                streakMap(mask) = 1 - ratio; % weight by streakiness
-            end
-        end
-    
-        % Smooth streaks with anisotropic Gaussian (minor axis only)
-        hsize = 5; % kernel size
-        sigma = 1; % smoothing along minor axis
-        streakCorrected = imgaussfilt(lum, sigma);
-    
-        % Blend back into RGB channels
-        rgbCorrected = rgbSignal;
-        for c = 1:3
-            rgbCorrected(:,:,c) = rgbSignal(:,:,c) .* (1 - streakMap) + streakCorrected .* streakMap;
-        end
-    end
-    
-    % Helper: create an ellipse mask
-    function mask = createEllipseMask(imSize, centroid, a, b, theta)
-        [X, Y] = meshgrid(1:imSize(2), 1:imSize(1));
-        x0 = centroid(1); y0 = centroid(2);
-        theta = deg2rad(theta);
-        Xr = (X - x0)*cos(theta) + (Y - y0)*sin(theta);
-        Yr = -(X - x0)*sin(theta) + (Y - y0)*cos(theta);
-        mask = (Xr.^2)/(a^2) + (Yr.^2)/(b^2) <= 1;
-    end
-
-% Proper Semi Blind Deconvolution
-function rgbCorrected = physicsDeconvolution(rgbSignal)
-% rgbSignal: linear RGB single image
-% rgbCorrected: RGB after streak / PSF deconvolution
-%
-% Fully drop-in: just call rgbCorrected = physicsDeconvolution(rgbSignal);
-
-    % ----------------- PARAMETERS -----------------
-    topPercentile = 99.5;  % for bright star detection
-    minBlobularity = 0.8;   % ratio minor/major axis to consider streaked
-    maxStars = 20;          % max stars to consider
-    psfSize = 15;           % PSF kernel size (pixels)
-    rlIterations = 8;       % RL deconvolution iterations
-
-    % ----------------- STEP 1: LUMINANCE -----------------
-    lum = 0.2989*rgbSignal(:,:,1) + 0.5870*rgbSignal(:,:,2) + 0.1140*rgbSignal(:,:,3);
-
-    % ----------------- STEP 2: BRIGHT STAR DETECTION -----------------
-    thresh = prctile(lum(:), topPercentile);
-    brightMask = lum >= thresh;
-    CC = bwconncomp(brightMask);
-    stats = regionprops(CC, 'Centroid', 'MajorAxisLength', 'MinorAxisLength', 'Orientation');
-
-    % Sort by brightness and limit number of stars
-    starValues = zeros(numel(stats),1);
-    for k = 1:numel(stats)
-        starValues(k) = lum(round(stats(k).Centroid(2)), round(stats(k).Centroid(1)));
-    end
-    [~, idxSort] = sort(starValues, 'descend');
-    stats = stats(idxSort);
-    if numel(stats) > maxStars
-        stats = stats(1:maxStars);
-    end
-
-    % ----------------- STEP 3: BUILD AVERAGE STAR PSF -----------------
-    psfAccum = zeros(psfSize, psfSize);
-    count = 0;
-    for k = 1:numel(stats)
-        ratio = stats(k).MinorAxisLength / stats(k).MajorAxisLength;
-        if ratio < minBlobularity
-            % build elliptical PSF kernel
-            a = stats(k).MajorAxisLength / 2;
-            b = stats(k).MinorAxisLength / 2;
-            theta = stats(k).Orientation;
-            psfKernel = createEllipsePSF(psfSize, a, b, theta);
-            psfAccum = psfAccum + psfKernel;
-            count = count + 1;
-        end
-    end
-    if count == 0
-        % fallback to circular PSF
-        psfKernel = fspecial('gaussian', psfSize, 1);
-    else
-        psfKernel = psfAccum / count;
-        psfKernel = psfKernel / sum(psfKernel(:)); % normalize
-    end
-
-    % ----------------- STEP 4: DECONVOLVE EACH CHANNEL -----------------
-    rgbCorrected = zeros(size(rgbSignal), 'like', rgbSignal);
-    for c = 1:3
-        rgbCorrected(:,:,c) = deconvlucy(rgbSignal(:,:,c), psfKernel, rlIterations);
-    end
-end
-
-    % ----------------- HELPER: CREATE ELLIPSE PSF -----------------
-    function psf = createEllipsePSF(psfSize, a, b, theta)
-    % Generate normalized elliptical PSF kernel
-    [X, Y] = meshgrid(1:psfSize, 1:psfSize);
-    x0 = ceil(psfSize/2); y0 = ceil(psfSize/2);
-    theta = deg2rad(theta);
-    Xr = (X - x0)*cos(theta) + (Y - y0)*sin(theta);
-    Yr = -(X - x0)*sin(theta) + (Y - y0)*cos(theta);
-    psf = exp(-((Xr.^2)/(2*a^2) + (Yr.^2)/(2*b^2)));
-    psf = psf / sum(psf(:));
 end
 
