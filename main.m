@@ -10,7 +10,7 @@
 %  - Image Processing Toolbox (demosaic, imfilter, denoiseImage)
 %  - Deep Learning Toolbox (for denoisingNetwork), or load an alternative net
 
-clear; clc;
+clear; clc; close all; 
 
 %% I/O
 srcDir  = 'Input';  rawFiles  = dir(fullfile(srcDir, '*.arw'));
@@ -18,17 +18,11 @@ flatDir = 'Flat';   flatFiles = dir(fullfile(flatDir, '*.arw'));
 destDir = 'Output'; if ~exist(destDir,'dir'), mkdir(destDir); end
 
 %% Options
-maxVal_img = 2^14 - 1;                % Global Weight Window for image normalization (adjust as needed)
 blackLevel = [512 512 512 512];       % [R, G1, G2, B]
-
-useIR = true;                         % true to halve green channel
 useAutoWB = true;                     % true to perform white balance
 
 % Hampel settings (applied on black-subtracted raw, removes hot pixels 8 average kernel) 
-doHampel = true;
-
-% LPF Settings (radius, skips if zero)
-minPixelDetail = 3;                  
+doHampel = true;              
 
 % CNN Denoiser (DnCNN)
 net = denoisingNetwork("DnCNN");
@@ -102,11 +96,6 @@ for idx = 1:length(rawFiles)
     refChannel = 'G';      % 'R', 'G', or 'B'  (reference channel whose median stays the same)
     allowAmplify = true;   % true = allow gains > 1; false = never amplify (only attenuate)
 
-    if useIR
-        % half the recorded green since IR contamination is common in some Sony sensors
-        rgbSignal(:, :, 2) = rgbSignal(:, :, 2) / 2;
-    end
-
     if useAutoWB
         % build bright-pixel mask (robust)
         grayLevels = sum(rgbSignal, 3);
@@ -164,30 +153,73 @@ for idx = 1:length(rawFiles)
         % diagnostics
         fprintf('AutoWB(ref=%s): nnz(mask)=%d raw_scales=[%.6g %.6g %.6g] gains=[%.6g %.6g %.6g] WB_Max=%.6g\n', ...
             refChannel, nnz(mask), scaleR, scaleG, scaleB, gR, gG, gB, max(rgbSignal(:)));
+
     end
 
+    % Normalize to [0, 1] after resize
+    fprintf('Normalized to [0, 1]\n')
+    prescaler = max(rgbSignal(:)); 
+    rgbSignal = rgbSignal()/prescaler;
 
-    % Apply Noise Filters
-    %rgbSignal = denoiseRGB(rgbSignal, net); % CNN Denoiser (very robust)
+    % ----------------- Apply Denoising and Image Processing Methids Here -----------------
 
-    %Apply smoothing filters
-    %rgbSignal = applyGaussianLowPass(rgbSignal, minPixelDetail); % LPF(skips if minPixelDetail == 0)
+    % A: Lowpass and resize
+    rgbSignal = applyGaussianLowPass(rgbSignal, 3); %minPixelDetail = 3 pixel
+    rgbSignal = imresize(rgbSignal, 0.5, 'lanczos3');
+    
+    % B: Generate PSF
+
+    % 1: Naive PSF Guess
+    % fwhm = 6;
+    % sigma = fwhm / 2.3548;
+    % psfSize = ceil(fwhm*2);
+    % psf_est = fspecial('gaussian', psfSize, sigma);
+
+    % 2: Smarter Guess, stars and remove background
+    bright_thresh = 0.75; 
+    patch_size = 19;
+    [psf_init, centroids, patch_stack] = estimate_star_psf(rgbSignal, patch_size, bright_thresh);
+
+    % C: Apply PSF for (semi) blind deconvolution
+    numIter = 50; NSR = 1e-2;
+    [rgbSignal, psf_est] = blindDeconvRGB(rgbSignal, psf_init, numIter, NSR);
+
+    % --- Display PSFs side by side ---
+        % figure;
+        % 
+        % % Initial PSF
+        % subplot(1,2,1);
+        % imagesc(psf_init);
+        % axis image;
+        % colormap hot;
+        % colorbar;
+        % title('Initial PSF Guess');
+        % 
+        % % Estimated PSF from blind deconvolution
+        % subplot(1,2,2);
+        % imagesc(psf_est);
+        % axis image;
+        % colormap hot;
+        % colorbar;
+        % title('Estimated PSF');
+        % 
+        % sgtitle('PSF Comparison');  % Optional super title
 
 
-    % ---------- SHOW ----------
-    %figure( 'Name', rawFiles(idx).name );
-    %imshow(rgbSignal / (max(rgbSignal(:))), []);
-    %title(sprintf('Sony ARW Linear RGGB Preview — %s', rawFiles(idx).name));
+    % Denoise again
+    %rgbSignal = denoiseRGB(rgbSignal, net);
+
 
     % ---------- SAVE ----------
     saveMode = 'fp32_scaled'; % 'fp32_raw' | 'fp32_scaled' | 'uint16_scaled'
-    minVal = min(rgbSignal(:));
-    maxVal = max(rgbSignal(:));
+    maxVal_img = 2^14 - 1; % Global Weight Window for image normalization (adjust as needed)
+    minVal = min(rgbSignal(:)); maxVal = max(rgbSignal(:));
     fprintf('Saving: min=%.6g  max=%.6g  mode=%s\n', minVal, maxVal, saveMode);
 
     [~, baseName, ~] = fileparts(rawFiles(idx).name);
     outFile = fullfile(destDir, [baseName, '.tif']);
 
+    %fix up this mess!
     switch saveMode
         case 'fp32_raw'
             t = Tiff(outFile, 'w');
@@ -209,7 +241,7 @@ for idx = 1:length(rawFiles)
             if maxVal == 0
                 rgbNorm = zeros(size(rgbSignal), 'single');
             else
-                rgbNorm = single(rgbSignal / maxVal_img);
+                rgbNorm = single(rgbSignal*prescaler / maxVal_img);
             end
             t = Tiff(outFile, 'w');
             tagstruct.ImageLength = size(rgbNorm,1);
@@ -359,9 +391,10 @@ function denoisedRGB = denoiseRGB(img, net)
 
     % 1. Normalize to [0,1] and do sanity check
     maxVal = max(img(:));
+    minVal = min(img(:));
     imgNorm = img / maxVal;
 
-    if maxVal == 0 || max(imgNorm(:) > 1)
+    if maxVal == 0 || minVal < 0
         error('Somethins broken');
     end
 
@@ -374,3 +407,76 @@ function denoisedRGB = denoiseRGB(img, net)
     % 3. Recombine and rescale back
     denoisedRGB = denoisedRGBNorm * maxVal;
 end
+
+% Estimate PSF
+function [psf_est, centroids, patch_stack] = estimate_star_psf(y, patch_size, bright_thresh)
+    
+    % grayscale and Normalize to 0 1
+    y_gray = im2gray(y); y_gray = y_gray / max(y_gray(:));
+
+    % threshold bright pixels
+    bw = y_gray > bright_thresh;
+    % keep local maxima only
+    bw = bw & imregionalmax(y_gray);
+    
+    % find centroids
+    cc = bwconncomp(bw);
+    props = regionprops(cc, 'Centroid');
+    num_stars = numel(props);
+    if num_stars == 0
+        error('No stars found. Lower bright_thresh or check image.');
+    end
+    centroids = reshape([props.Centroid],2,[])';
+    
+    % prepare patch extraction
+    half = floor(patch_size/2);
+    y_pad = padarray(y_gray, [half half], median(y_gray(:)), 'both');
+    
+    % extract patches
+    patch_stack = zeros(patch_size, patch_size, num_stars);
+    bg = median(y_gray(:));  % global background (or local per patch)
+
+    for k = 1:num_stars
+        c = round(centroids(k,:));
+        cx = c(1) + half; cy = c(2) + half;
+        patch = y_pad(cy-half:cy+half, cx-half:cx+half);
+        
+        % subtract background & clip
+        patch = patch - bg;
+        patch(patch < 0) = 0;
+        
+        patch_stack(:,:,k) = patch;
+    end
+
+    % estimate PSF as median of stacked patches
+    psf_est = median(patch_stack,3);
+    psf_est = psf_est / sum(psf_est(:));  % normalize
+
+    % Ensure PSF is non-negative
+    psf_est(psf_est < 0) = 0;
+
+end
+
+% Blind deconv
+function [x_recovered, h_est] = blindDeconvRGB(y, h, numIter, NSR)
+
+    % 1: (semi) Blind deconvolution on luminance weighted to 0 1
+    y_gray = im2gray(y); y_gray = y_gray / max(y_gray(:));
+
+    [~, h_est] = deconvblind(y_gray, h, numIter);
+    %h_est = h;
+
+    % 2: Apply to other channels
+    x_1 = deconvwnr(y(:,:,1), h_est, NSR);
+    x_2 = deconvwnr(y(:,:,2), h_est, NSR);
+    x_3 = deconvwnr(y(:,:,3), h_est, NSR);
+    
+    % 3: Concatenate recovered
+    x_recovered = cat(3, x_1, x_2, x_3);
+    
+    %fix weirdness
+    x_recovered(x_recovered < 0) = 0;
+    x_recovered(x_recovered > 1) = 1; 
+ 
+end
+
