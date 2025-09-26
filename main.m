@@ -47,7 +47,7 @@ else
         fprintf('  Loading flat: %s\n', flatFiles(idx).name);
 
         % same pipeline as lights
-        flatRGB = rawToRGB(rawPath, 'BlackLevel', blackLevel, 'RemoveHotPixels', true, 'ClipMax', maxVal_img);
+        flatRGB = rawToRGB(rawPath, 'BlackLevel', blackLevel, 'RemoveHotPixels', true);
 
         % stack as single precision
         flatStack(:,:,:,idx) = single(flatRGB);
@@ -87,7 +87,7 @@ for idx = 1:length(rawFiles)
 
     % Convert RAW -> linear RGB (single). rawToRGB handles hot pixel removal,
     % black subtraction and demosaic for RGGB pattern by default.
-    rgbSignal = rawToRGB(rawFilePath, 'BlackLevel', blackLevel, 'RemoveHotPixels', true, 'ClipMax', maxVal_img);
+    rgbSignal = rawToRGB(rawFilePath, 'BlackLevel', blackLevel, 'RemoveHotPixels', true);
 
     % Apply master flat correction if available
     if exist('masterFlatInv','var') && ~isempty(masterFlatInv)
@@ -162,16 +162,16 @@ for idx = 1:length(rawFiles)
         rgbSignal(:,:,3) = B .* gB;
 
         % diagnostics
-        fprintf('AutoWB(ref=%s): nnz(mask)=%d raw_scales=[%.6g %.6g %.6g] gains=[%.6g %.6g %.6g] finalMax=%.6g\n', ...
+        fprintf('AutoWB(ref=%s): nnz(mask)=%d raw_scales=[%.6g %.6g %.6g] gains=[%.6g %.6g %.6g] WB_Max=%.6g\n', ...
             refChannel, nnz(mask), scaleR, scaleG, scaleB, gR, gG, gB, max(rgbSignal(:)));
     end
 
 
     % Apply Noise Filters
-    rgbSignal = denoiseRGB(rgbSignal, net); % CNN Denoiser (very robust)
+    %rgbSignal = denoiseRGB(rgbSignal, net); % CNN Denoiser (very robust)
 
     %Apply smoothing filters
-    rgbSignal = applyGaussianLowPass(rgbSignal, minPixelDetail); % LPF(skips if minPixelDetail == 0)
+    %rgbSignal = applyGaussianLowPass(rgbSignal, minPixelDetail); % LPF(skips if minPixelDetail == 0)
 
 
     % ---------- SHOW ----------
@@ -260,13 +260,11 @@ function rgbSignal = rawToRGB(rawFilePath, varargin)
     addRequired(p, 'rawFilePath', @(x) ischar(x) || isstring(x));
     addParameter(p, 'BlackLevel', [0 0 0 0], @(x) isnumeric(x) && (isscalar(x) || numel(x)==4));
     addParameter(p, 'RemoveHotPixels', true, @(x) islogical(x) || (isnumeric(x) && ismember(x,[0 1])));
-    addParameter(p, 'ClipMax', 65535, @(x) isnumeric(x) && isscalar(x) && x>0);
     parse(p, rawFilePath, varargin{:});
 
     rawFilePath = char(p.Results.rawFilePath);
     blackLevel = single(p.Results.BlackLevel);
     removeHot = logical(p.Results.RemoveHotPixels);
-    clipMax = single(p.Results.ClipMax);
 
     if isscalar(blackLevel)
         blackLevel = repmat(blackLevel,1,4);
@@ -300,10 +298,6 @@ function rgbSignal = rawToRGB(rawFilePath, varargin)
     catch
         error('rawToRGB:IndexingError', 'Error subtracting black levels. Check CFA dimensions and provided BlackLevel.');
     end
-
-    % Clamp
-    cfaImage(cfaImage < 0) = 0;
-    cfaImage(cfaImage > clipMax) = clipMax;
 
     % Demosaic (MATLAB expects 'Rggb' with exact capitalization)
     rgbSignal = single(demosaic(uint16(cfaImage), 'Rggb'));
@@ -362,27 +356,21 @@ end
 
 % Function to denoise RGB with dynamic range compander
 function denoisedRGB = denoiseRGB(img, net)
-    % img : input RGB image (single, arbitrary scale)
-    % net : pretrained DnCNN (or other) denoising network accepted by denoiseImage()
 
-    % protect against all-zero image
+    % 1. Normalize to [0,1] and do sanity check
     maxVal = max(img(:));
-    if maxVal == 0
-        denoisedRGB = img;
-        return;
+    imgNorm = img / maxVal;
+
+    if maxVal == 0 || max(imgNorm(:) > 1)
+        error('Somethins broken');
     end
 
-    % 1. Normalize to [0,1]
-    imgNorm = img / maxVal;
-    imgNorm = min(max(imgNorm,0),1);
-
     % 2. Denoise each channel
-    denoisedR = denoiseImage(imgNorm(:,:,1), net);
-    denoisedG = denoiseImage(imgNorm(:,:,2), net);
-    denoisedB = denoiseImage(imgNorm(:,:,3), net);
+    denoisedRGBNorm = zeros(size(imgNorm), 'like', imgNorm);
+    for i = 1:3
+        denoisedRGBNorm(:,:,i) = denoiseImage(imgNorm(:,:,i), net);
+    end
 
     % 3. Recombine and rescale back
-    denoisedRGBNorm = cat(3, denoisedR, denoisedG, denoisedB);
     denoisedRGB = denoisedRGBNorm * maxVal;
 end
-
