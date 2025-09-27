@@ -4,11 +4,6 @@
 %  - converts each RAW to an RGB linear image using rawToRGB()
 %  - optional IR handling, AutoWB, denoise, lowpass (optional)
 %  - saves TIFF outputs to Output/
-%
-% Requirements:
-%  - rawread (or replace the call inside rawToRGB)
-%  - Image Processing Toolbox (demosaic, imfilter, denoiseImage)
-%  - Deep Learning Toolbox (for denoisingNetwork), or load an alternative net
 
 clear; clc; close all; 
 
@@ -177,7 +172,7 @@ for idx = 1:length(rawFiles)
 
     % 2: Smarter Guess, stars and remove background
     bright_thresh = 0.75; 
-    patch_size = 19;
+    patch_size = 25;
     [psf_init, centroids, patch_stack] = estimate_star_psf(rgbSignal, patch_size, bright_thresh);
 
     % C: Apply PSF for (semi) blind deconvolution
@@ -206,7 +201,7 @@ for idx = 1:length(rawFiles)
         % sgtitle('PSF Comparison');  % Optional super title
 
 
-    % Denoise again
+    % D: Denoise again
     %rgbSignal = denoiseRGB(rgbSignal, net);
 
 
@@ -408,7 +403,7 @@ function denoisedRGB = denoiseRGB(img, net)
     denoisedRGB = denoisedRGBNorm * maxVal;
 end
 
-% Estimate PSF
+% Estimate PSF from Centroids with background subtraction
 function [psf_est, centroids, patch_stack] = estimate_star_psf(y, patch_size, bright_thresh)
     
     % grayscale and Normalize to 0 1
@@ -457,7 +452,7 @@ function [psf_est, centroids, patch_stack] = estimate_star_psf(y, patch_size, br
 
 end
 
-% Blind deconv
+% Blind Deconvolution Function
 function [x_recovered, h_est] = blindDeconvRGB(y, h, numIter, NSR)
 
     % 1: (semi) Blind deconvolution on luminance weighted to 0 1
