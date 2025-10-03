@@ -49,7 +49,7 @@ for c = 1:size(y,3)
 end
 
 % Display results using autoscale (helps debugging)
-figure('Name','Deconvolution (y | h | x_est)','NumberTitle','off','Color','w');
+figure('Name','Deconvolution (y | h | x_est)','NumberTitle','off');
 subplot(1,3,1); imshow(y); title('y (blurry input)');
 subplot(1,3,2); imshow(h); title('PSF (as read)');
 subplot(1,3,3); imshow(x_est, []); title('x\_est (deconvolved, autoscaled)');
