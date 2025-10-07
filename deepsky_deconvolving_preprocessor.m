@@ -54,194 +54,194 @@ diagDir = fullfile(pwd, 'flat_diag');
 if ~exist('flatFiles','var') || isempty(flatFiles)
     masterFlat  = [];
     masterFlatInv = [];
-    fprintf('No flat frames found — skipping flat creation.\n\n');
-    return;
-end
+    warning('No flat frames found — skipping flat creation.\n\n');
 
-% quick type & shape checks (assume rawToRGB returns HxWx3)
-nFlats = numel(flatFiles);
-fprintf('Found %d flat files. Loading and stacking...\n', nFlats);
-
-% Preallocate stack lazily after first successful read to know image size
-flatStack = [];
-loaded = 0;
-
-for fidx = 1:nFlats
-    rawPath = fullfile(flatFiles(fidx).folder, flatFiles(fidx).name);
-    fprintf('  [%d/%d] Loading: %s\n', fidx, nFlats, flatFiles(fidx).name);
-    try
-        flatRGB = rawToRGB(rawPath, 'BlackLevel', blackLevel, 'RemoveHotPixels', true);
-    catch ME
-        warning('  Failed to read flat "%s": %s — skipping this file.', flatFiles(fidx).name, ME.message);
-        continue;
-    end
-
-    % Validate shape & cast to single
-    if ndims(flatRGB) ~= 3 || size(flatRGB,3) ~= 3
-        warning('  Unexpected flat image shape for "%s" — skipping.', flatFiles(fidx).name);
-        continue;
-    end
-    flatRGB = single(flatRGB);
-
-    if loaded == 0
-        [H, W, ~] = size(flatRGB);
-        flatStack = zeros(H, W, 3, nFlats, 'single');  % max allocation; we track actual count with 'loaded'
-    end
-
-    loaded = loaded + 1;
-    flatStack(:,:,:,loaded) = flatRGB;
-end
-
-if loaded == 0
-    masterFlat = [];
-    masterFlatInv = [];
-    warning('No usable flat frames were loaded.');
-    return;
-end
-
-% Trim unused preallocated slots if any
-if loaded < nFlats
-    flatStack(:,:,:,loaded+1:end) = [];
-end
-
-% ---------------------- Compute per-pixel statistics -----------------------
-% Per-pixel mean and std across the stack
-masterMean = mean(flatStack, 4);   % H x W x 3
-masterStd  = std(flatStack, 0, 4); % H x W x 3
-
-masterMean = single(masterMean);
-masterStd  = single(masterStd);
-
-% ------------------------- Optional smoothing ------------------------------
-if params.doSmooth && params.smoothSigmaPx > 0
-    % Use imgaussfilt with automatic filter sizing (safer than forcing an
-    % odd size). Slightly more control then before
-    for c = 1:3
-        masterMean(:,:,c) = imgaussfilt(masterMean(:,:,c), params.smoothSigmaPx);
-    end
-end
-
-% ----------------------------- SNR -> confidence ---------------------------
-tiny = 1e-12;
-snrMap = masterMean ./ (masterStd + tiny);  % per-pixel SNR map
-
-% determine snrMax robustly using percentile across all valid SNR entries
-snrVals = snrMap(:);
-validMask = isfinite(snrVals) & (snrVals > 0);
-if any(validMask)
-    snrMax = prctile(snrVals(validMask), params.snrPercentileClipping);
 else
-    snrMax = max(snrMap(:));
-end
-if isempty(snrMax) || snrMax <= 0
-    snrMax = max(snrMap(:));
-end
-snrMax = max(single(snrMax), tiny);
-
-% Map SNR to confidence [0,1] per channel (linear ramp between snrFloor..snrMax)
-confMap = zeros(size(snrMap), 'single');
-for c = 1:3
-    conf = (snrMap(:,:,c) - params.snrFloor) ./ (snrMax - params.snrFloor);
-    confMap(:,:,c) = min(max(conf, 0), 1);
-end
-
-% ------------------------ Normalize master mean -> masterFlat --------------
-masterFlat = zeros(size(masterMean), 'single');
-for c = 1:3
-    ch = masterMean(:,:,c);
-    pos = ch(ch > 0);
-    if isempty(pos)
-        warning('Flat channel %d: no positive pixels found; using unity channel.', c);
-        masterFlat(:,:,c) = ones(size(ch), 'single');
-        continue;
+    % quick type & shape checks (assume rawToRGB returns HxWx3)
+    nFlats = numel(flatFiles);
+    fprintf('Found %d flat files. Loading and stacking...\n', nFlats);
+    
+    % Preallocate stack lazily after first successful read to know image size
+    flatStack = [];
+    loaded = 0;
+    
+    for fidx = 1:nFlats
+        rawPath = fullfile(flatFiles(fidx).folder, flatFiles(fidx).name);
+        fprintf('  [%d/%d] Loading: %s\n', fidx, nFlats, flatFiles(fidx).name);
+        try
+            flatRGB = rawToRGB(rawPath, 'BlackLevel', blackLevel, 'RemoveHotPixels', true);
+        catch ME
+            warning('  Failed to read flat "%s": %s — skipping this file.', flatFiles(fidx).name, ME.message);
+            continue;
+        end
+    
+        % Validate shape & cast to single
+        if ndims(flatRGB) ~= 3 || size(flatRGB,3) ~= 3
+            warning('  Unexpected flat image shape for "%s" — skipping.', flatFiles(fidx).name);
+            continue;
+        end
+        flatRGB = single(flatRGB);
+    
+        if loaded == 0
+            [H, W, ~] = size(flatRGB);
+            flatStack = zeros(H, W, 3, nFlats, 'single');  % max allocation; we track actual count with 'loaded'
+        end
+    
+        loaded = loaded + 1;
+        flatStack(:,:,:,loaded) = flatRGB;
     end
-
-    pval = prctile(pos, params.percentileScale);
-    if pval <= tiny
-        pval = median(pos);
-        if pval <= tiny
-            warning('Flat channel %d: percentile and median are tiny — using unity.', c);
+    
+    if loaded == 0
+        masterFlat = [];
+        masterFlatInv = [];
+        warning('No usable flat frames were loaded.');
+        return;
+    end
+    
+    % Trim unused preallocated slots if any
+    if loaded < nFlats
+        flatStack(:,:,:,loaded+1:end) = [];
+    end
+    
+    % ---------------------- Compute per-pixel statistics -----------------------
+    % Per-pixel mean and std across the stack
+    masterMean = mean(flatStack, 4);   % H x W x 3
+    masterStd  = std(flatStack, 0, 4); % H x W x 3
+    
+    masterMean = single(masterMean);
+    masterStd  = single(masterStd);
+    
+    % ------------------------- Optional smoothing ------------------------------
+    if params.doSmooth && params.smoothSigmaPx > 0
+        % Use imgaussfilt with automatic filter sizing (safer than forcing an
+        % odd size). Slightly more control then before
+        for c = 1:3
+            masterMean(:,:,c) = imgaussfilt(masterMean(:,:,c), params.smoothSigmaPx);
+        end
+    end
+    
+    % ----------------------------- SNR -> confidence ---------------------------
+    tiny = 1e-12;
+    snrMap = masterMean ./ (masterStd + tiny);  % per-pixel SNR map
+    
+    % determine snrMax robustly using percentile across all valid SNR entries
+    snrVals = snrMap(:);
+    validMask = isfinite(snrVals) & (snrVals > 0);
+    if any(validMask)
+        snrMax = prctile(snrVals(validMask), params.snrPercentileClipping);
+    else
+        snrMax = max(snrMap(:));
+    end
+    if isempty(snrMax) || snrMax <= 0
+        snrMax = max(snrMap(:));
+    end
+    snrMax = max(single(snrMax), tiny);
+    
+    % Map SNR to confidence [0,1] per channel (linear ramp between snrFloor..snrMax)
+    confMap = zeros(size(snrMap), 'single');
+    for c = 1:3
+        conf = (snrMap(:,:,c) - params.snrFloor) ./ (snrMax - params.snrFloor);
+        confMap(:,:,c) = min(max(conf, 0), 1);
+    end
+    
+    % ------------------------ Normalize master mean -> masterFlat --------------
+    masterFlat = zeros(size(masterMean), 'single');
+    for c = 1:3
+        ch = masterMean(:,:,c);
+        pos = ch(ch > 0);
+        if isempty(pos)
+            warning('Flat channel %d: no positive pixels found; using unity channel.', c);
             masterFlat(:,:,c) = ones(size(ch), 'single');
             continue;
         end
-    end
-
-    normCh = ch / pval;                       % representative bright pixels ~ 1.0
-    normCh = max(normCh, params.minNormVal);  % floor tiny pixels to avoid extreme inverse
-    masterFlat(:,:,c) = single(normCh);
-    fprintf(' Flat ch%d: p%g = %.6g (snrFloor=%.3g snrMax~%.3g)\n', c, params.percentileScale, pval, params.snrFloor, snrMax);
-end
-
-% ------------------------- Compute final inverse gain ---------------------
-rawInv = 1 ./ masterFlat;                    % per-pixel raw inverse
-masterFlatInv = 1 + (rawInv - 1) .* confMap; % blend: 1 = no-op, rawInv = full correction
-masterFlatInv = single(masterFlatInv);
-
-% Hard cap gains
-masterFlatInv(masterFlatInv > params.maxGain) = params.maxGain;
-
-% ------------------------- Tonal / radial taper ----------------------------
-if params.doRadialTaper
-    innerR = params.innerR;
-    outerR = params.outerR;
-    alpha  = params.alpha;
-    power  = params.power;
-    useSigmoid = params.useSigmoid;
-
-    % ensure radii valid
-    if outerR <= innerR
-        outerR = min(0.995, innerR + 0.01);
-    end
-
-    [H, W, ~] = size(masterFlatInv);
-    [xg, yg] = meshgrid((1:W) - (W + 1)/2, (1:H) - (H + 1)/2);
-    rnorm = sqrt(xg.^2 + yg.^2) / sqrt(((W+1)/2)^2 + ((H+1)/2)^2);
-    t = (rnorm - innerR) ./ (outerR - innerR);
-    t = min(max(t,0),1);
-
-    if useSigmoid
-        k = 8 * power;
-        s = 1 ./ (1 + exp(-k * (t - 0.5)));
-        blend_base = 1 - s;
-        blend_base = (blend_base - min(blend_base(:))) / (max(blend_base(:)) - min(blend_base(:)) + eps);
-    else
-        if power == 1
-            blend_base = 0.5 * (1 + cos(pi * t));
-        else
-            t_warp = t .^ power;
-            blend_base = 0.5 * (1 + cos(pi * t_warp));
+    
+        pval = prctile(pos, params.percentileScale);
+        if pval <= tiny
+            pval = median(pos);
+            if pval <= tiny
+                warning('Flat channel %d: percentile and median are tiny — using unity.', c);
+                masterFlat(:,:,c) = ones(size(ch), 'single');
+                continue;
+            end
         end
+    
+        normCh = ch / pval;                       % representative bright pixels ~ 1.0
+        normCh = max(normCh, params.minNormVal);  % floor tiny pixels to avoid extreme inverse
+        masterFlat(:,:,c) = single(normCh);
+        fprintf(' Flat ch%d: p%g = %.6g (snrFloor=%.3g snrMax~%.3g)\n', c, params.percentileScale, pval, params.snrFloor, snrMax);
     end
-
-    % final blend: mix toward unity a bit using alpha
-    final_blend = (1 - alpha) + alpha * blend_base;  % range [1-alpha .. 1]
-
-    % apply same blend across channels (simple and robust)
-    for c = 1:3
-        b = final_blend;
-        masterFlatInv(:,:,c) = 1 .* (1 - b) + masterFlatInv(:,:,c) .* b;
+    
+    % ------------------------- Compute final inverse gain ---------------------
+    rawInv = 1 ./ masterFlat;                    % per-pixel raw inverse
+    masterFlatInv = 1 + (rawInv - 1) .* confMap; % blend: 1 = no-op, rawInv = full correction
+    masterFlatInv = single(masterFlatInv);
+    
+    % Hard cap gains
+    masterFlatInv(masterFlatInv > params.maxGain) = params.maxGain;
+    
+    % ------------------------- Tonal / radial taper ----------------------------
+    if params.doRadialTaper
+        innerR = params.innerR;
+        outerR = params.outerR;
+        alpha  = params.alpha;
+        power  = params.power;
+        useSigmoid = params.useSigmoid;
+    
+        % ensure radii valid
+        if outerR <= innerR
+            outerR = min(0.995, innerR + 0.01);
+        end
+    
+        [H, W, ~] = size(masterFlatInv);
+        [xg, yg] = meshgrid((1:W) - (W + 1)/2, (1:H) - (H + 1)/2);
+        rnorm = sqrt(xg.^2 + yg.^2) / sqrt(((W+1)/2)^2 + ((H+1)/2)^2);
+        t = (rnorm - innerR) ./ (outerR - innerR);
+        t = min(max(t,0),1);
+    
+        if useSigmoid
+            k = 8 * power;
+            s = 1 ./ (1 + exp(-k * (t - 0.5)));
+            blend_base = 1 - s;
+            blend_base = (blend_base - min(blend_base(:))) / (max(blend_base(:)) - min(blend_base(:)) + eps);
+        else
+            if power == 1
+                blend_base = 0.5 * (1 + cos(pi * t));
+            else
+                t_warp = t .^ power;
+                blend_base = 0.5 * (1 + cos(pi * t_warp));
+            end
+        end
+    
+        % final blend: mix toward unity a bit using alpha
+        final_blend = (1 - alpha) + alpha * blend_base;  % range [1-alpha .. 1]
+    
+        % apply same blend across channels (simple and robust)
+        for c = 1:3
+            b = final_blend;
+            masterFlatInv(:,:,c) = 1 .* (1 - b) + masterFlatInv(:,:,c) .* b;
+        end
+    
+        fprintf('Applied radial taper (inner=%.2f outer=%.2f alpha=%.2f power=%.2f sigmoid=%d)\n', ...
+            innerR, outerR, alpha, power, useSigmoid);
     end
+    
+    % ------------------------------- Diagnostics --------------------------------
+    if params.doDiagnostics
+        if ~exist(diagDir,'dir'), mkdir(diagDir); end
+        imwrite(mat2gray(masterFlat(:,:,2)), fullfile(diagDir,'masterFlat_G.png'));
+        imwrite(mat2gray(masterFlatInv(:,:,2)), fullfile(diagDir,'masterFlatInv_G.png'));
+        imwrite(mat2gray(confMap(:,:,2)), fullfile(diagDir,'confidence_G.png'));
+        save(fullfile(diagDir,'flat_maps.mat'),'masterMean','masterStd','masterFlat','masterFlatInv','confMap','-v7.3');
+        fprintf('Diagnostics saved to %s\n', diagDir);
+    end
+    
+    fprintf('Master flat ready: size=%dx%dx3  inv_min=%.3g inv_max=%.3g (maxGain=%.3g)\n', ...
+        size(masterFlat,1), size(masterFlat,2), min(masterFlatInv(:)), max(masterFlatInv(:)), params.maxGain);
+    
+    elapsedTime = toc;
+    fprintf('Flats pass done. Elapsed time: %.2f sec\n\n', elapsedTime);
 
-    fprintf('Applied radial taper (inner=%.2f outer=%.2f alpha=%.2f power=%.2f sigmoid=%d)\n', ...
-        innerR, outerR, alpha, power, useSigmoid);
 end
-
-% ------------------------------- Diagnostics --------------------------------
-if params.doDiagnostics
-    if ~exist(diagDir,'dir'), mkdir(diagDir); end
-    imwrite(mat2gray(masterFlat(:,:,2)), fullfile(diagDir,'masterFlat_G.png'));
-    imwrite(mat2gray(masterFlatInv(:,:,2)), fullfile(diagDir,'masterFlatInv_G.png'));
-    imwrite(mat2gray(confMap(:,:,2)), fullfile(diagDir,'confidence_G.png'));
-    save(fullfile(diagDir,'flat_maps.mat'),'masterMean','masterStd','masterFlat','masterFlatInv','confMap','-v7.3');
-    fprintf('Diagnostics saved to %s\n', diagDir);
-end
-
-fprintf('Master flat ready: size=%dx%dx3  inv_min=%.3g inv_max=%.3g (maxGain=%.3g)\n', ...
-    size(masterFlat,1), size(masterFlat,2), min(masterFlatInv(:)), max(masterFlatInv(:)), params.maxGain);
-
-elapsedTime = toc;
-fprintf('Flats pass done. Elapsed time: %.2f sec\n\n', elapsedTime);
-
 
 %% Process Light Frames    
 tic
