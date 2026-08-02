@@ -291,7 +291,3 @@ Future work:
 * automated stacking integration
 
 ---
-
-# License
-
-License information will be added here.
