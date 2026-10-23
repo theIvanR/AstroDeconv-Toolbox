@@ -26,8 +26,8 @@ Exact requirements may depend on the calibration functions and conversion tools 
 
 ```text
 Astro-Deconv-Toolbox/
-├── calibrate_frames.m
-├── deconv.m
+├── calibration_script.m
+├── deconvolution_script.m
 ├── functions/
 ├── input/
 │   ├── light/
@@ -65,7 +65,7 @@ Where possible, preserve linear intensity data and avoid applying gamma correcti
 Run the MATLAB script:
 
 ```matlab
-calibrate_frames
+calibration_script
 ```
 
 This stage prepares the light frames using the available calibration data and writes the resulting frames to `output/`.
@@ -85,7 +85,7 @@ Save the resulting stacked image as a supported image format, such as TIFF, in t
 Run:
 
 ```matlab
-deconv
+deconvolution_script
 ```
 
 The deconvolution pipeline:
